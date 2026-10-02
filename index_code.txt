@@ -1,0 +1,1060 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  StyleSheet, Text, View, TextInput, TouchableOpacity, SafeAreaView,
+  ActivityIndicator, Image, FlatList, Platform, StatusBar, Alert, ScrollView, AppState,
+} from 'react-native';
+import { initializeApp } from 'firebase/app';
+import {
+  initializeAuth, getReactNativePersistence,
+  createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged,
+  EmailAuthProvider, reauthenticateWithCredential, updatePassword, sendPasswordResetEmail,
+} from 'firebase/auth';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, waitForPendingWrites,
+} from 'firebase/firestore';
+import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+import * as XLSX from 'xlsx';
+import DateTimePicker from '@react-native-community/datetimepicker';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAi8kPcmU8cI8h6zxMrvJtbBjTa11sxdVo",
+  authDomain: "mylibrary2k26.firebaseapp.com",
+  projectId: "mylibrary2k26",
+  storageBucket: "mylibrary2k26.firebasestorage.app",
+  messagingSenderId: "210341086639",
+  appId: "1:210341086639:web:4a8fcf26b03434e33ddb5a"
+};
+const app = initializeApp(firebaseConfig);
+const auth = initializeAuth(app, { persistence: getReactNativePersistence(AsyncStorage) });
+const db = getFirestore(app);
+
+const COLORS = {
+  paper: '#efe3c8', card: '#f7efdc', ink: '#3a2f22', inkSoft: '#6b5c46',
+  green: '#7c9473', yellow: '#c99a3c', sky: '#5f8ea3', terracotta: '#bd6448',
+  border: '#c9b489', tileOrange: '#f0d7a0',
+};
+const PALETTE = ['#7c9473', '#c99a3c', '#5f8ea3', '#bd6448', '#a68b5c'];
+const colorFor = (name) => {
+  let h = 0; for (let i = 0; i < (name || '').length; i++) h = (h << 5) - h + name.charCodeAt(i);
+  return PALETTE[Math.abs(h) % PALETTE.length];
+};
+
+const LABELS = {
+  type: 'स्वरुप',
+  typePhysical: 'Physical-book',
+  typeEbook: 'E-book',
+  genre: 'साहित्य प्रकार',
+  isbn: 'ISBN/ Reg. No.',
+  purchaseDate: 'खरेदी दिनांक',
+  galleryBtn: '🖼️ On Device',
+};
+const typeLabel = (t) => (t === 'e' ? LABELS.typeEbook : LABELS.typePhysical);
+
+const booksCol = (uid) => collection(db, 'libraries', uid, 'books');
+const wishCol = (uid) => collection(db, 'libraries', uid, 'wishlists');
+const recycleCol = (uid) => collection(db, 'libraries', uid, 'recycle');
+const libDoc = (uid) => doc(db, 'libraries', uid);
+
+const fmtDate = (d) => {
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), da = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${da}`;
+};
+
+/* ---------- OFFLINE-SAFE WRITE QUEUE (real disk via AsyncStorage) ---------- */
+const PENDING_KEY = 'pendingOps_v1';
+async function loadPending() {
+  const raw = await AsyncStorage.getItem(PENDING_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+async function savePending(list) { await AsyncStorage.setItem(PENDING_KEY, JSON.stringify(list)); }
+async function enqueue(kind, payload) {
+  const list = await loadPending();
+  const id = Date.now() + '_' + Math.random().toString(36).slice(2);
+  list.push({ id, kind, payload });
+  await savePending(list);
+  return id;
+}
+async function dequeue(id) {
+  const list = await loadPending();
+  await savePending(list.filter((o) => o.id !== id));
+}
+async function performOp(uid, op) {
+  const { kind, payload } = op;
+  if (kind === 'addBook') await addDoc(booksCol(uid), payload.data);
+  else if (kind === 'updateBook') await updateDoc(doc(booksCol(uid), payload.docId), payload.data);
+  else if (kind === 'deleteBook') await deleteDoc(doc(booksCol(uid), payload.docId));
+  else if (kind === 'addWishlistKnownId') await setDoc(doc(wishCol(uid), payload.docId), payload.data);
+  else if (kind === 'updateWishlist') await updateDoc(doc(wishCol(uid), payload.docId), payload.data);
+  else if (kind === 'deleteWishlist') await deleteDoc(doc(wishCol(uid), payload.docId));
+  else if (kind === 'addRecycle') await addDoc(recycleCol(uid), payload.data);
+  else if (kind === 'deleteRecycle') await deleteDoc(doc(recycleCol(uid), payload.docId));
+  else if (kind === 'saveSettings') await setDoc(libDoc(uid), payload.data, { merge: true });
+}
+async function runOp(uid, kind, payload) {
+  const id = await enqueue(kind, payload);
+  try {
+    await performOp(uid, { kind, payload });
+    await waitForPendingWrites(db);
+    await dequeue(id);
+  } catch (e) {
+    // offline — stays queued, replayPending() will retry later
+  }
+}
+async function replayPending(uid) {
+  if (!uid) return;
+  const list = await loadPending();
+  for (const op of list) {
+    try {
+      await performOp(uid, op);
+      await waitForPendingWrites(db);
+      await dequeue(op.id);
+    } catch (e) { break; } // still offline — stop, try again next time
+  }
+}
+
+export default function App() {
+  const [checkingAuth, setCheckingAuth] = useState(true);
+  const [user, setUser] = useState(null);
+  const [page, setPage] = useState('login');
+
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
+
+  const [books, setBooks] = useState([]);
+  const [wishlists, setWishlists] = useState([]);
+  const [recycle, setRecycle] = useState([]);
+  const [settings, setSettings] = useState({ libName: 'गोतावळा', libLogo: '📚', about: '' });
+
+  const [backupDirUri, setBackupDirUri] = useState(null);
+  const backupTimer = useRef(null);
+
+  const [currentBookId, setCurrentBookId] = useState(null);
+  const [currentWishId, setCurrentWishId] = useState(null);
+  const [wishTitleDraft, setWishTitleDraft] = useState('');
+  const [wishNotesDraft, setWishNotesDraft] = useState('');
+  const [sortMode, setSortMode] = useState('latest');
+  const [searchQuery, setSearchQuery] = useState('');
+
+  const [formMode, setFormMode] = useState('add');
+  const [fName, setFName] = useState('');
+  const [fType, setFType] = useState('physical');
+  const [fAuthor, setFAuthor] = useState('');
+  const [fGenre, setFGenre] = useState('');
+  const [fPurchase, setFPurchase] = useState('');
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [fPublication, setFPublication] = useState('');
+  const [fPrice, setFPrice] = useState('');
+  const [fIsbn, setFIsbn] = useState('');
+  const [fNote, setFNote] = useState('');
+  const [fPhoto, setFPhoto] = useState(null);
+  const [savingBook, setSavingBook] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  const [oldPass, setOldPass] = useState('');
+  const [newPass, setNewPass] = useState('');
+
+  const [lockPref, setLockPref] = useState('always');
+  const [locked, setLocked] = useState(false);
+  const [lockPassInput, setLockPassInput] = useState('');
+  const [lockError, setLockError] = useState('');
+  const coldStartChecked = useRef(false);
+
+  const [selKind, setSelKind] = useState(null);
+  const [selIds, setSelIds] = useState({});
+  const isSelecting = (kind) => selKind === kind && Object.keys(selIds).length > 0;
+  const startSelect = (kind, id) => { setSelKind(kind); setSelIds({ [id]: true }); };
+  const toggleSelect = (kind, id) => {
+    setSelIds((prev) => {
+      const next = { ...prev };
+      if (next[id]) delete next[id]; else next[id] = true;
+      if (Object.keys(next).length === 0) setSelKind(null);
+      return next;
+    });
+  };
+  const clearSelect = () => { setSelKind(null); setSelIds({}); };
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u); setCheckingAuth(false);
+      if (u) setPage('home'); else setPage('login');
+    });
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.getItem('backupDirUri').then((v) => { if (v) setBackupDirUri(v); });
+  }, []);
+
+  useEffect(() => {
+    if (checkingAuth || !user || coldStartChecked.current) return;
+    coldStartChecked.current = true;
+    (async () => {
+      const pref = (await AsyncStorage.getItem('appLockPref')) || 'always';
+      setLockPref(pref);
+      if (pref === 'off') return;
+      if (pref === '5min') {
+        const last = Number((await AsyncStorage.getItem('lastActiveTs')) || 0);
+        if (Date.now() - last <= 5 * 60 * 1000) return;
+      }
+      setLocked(true);
+    })();
+  }, [checkingAuth, user]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (state) => {
+      if (state === 'background' || state === 'inactive') {
+        await AsyncStorage.setItem('lastActiveTs', String(Date.now()));
+      } else if (state === 'active' && user && !checkingAuth) {
+        replayPending(user.uid);
+        if (lockPref === 'off') return;
+        if (lockPref === '5min') {
+          const last = Number((await AsyncStorage.getItem('lastActiveTs')) || 0);
+          if (Date.now() - last > 5 * 60 * 1000) setLocked(true);
+        } else if (lockPref === 'always') {
+          setLocked(true);
+        }
+      }
+    });
+    return () => sub.remove();
+  }, [lockPref, user, checkingAuth]);
+
+  const unlockApp = () => {
+    if (!lockPassInput) { setLockError('Password टाका'); return; }
+    signInWithEmailAndPassword(auth, user.email, lockPassInput)
+      .then(() => { setLocked(false); setLockPassInput(''); setLockError(''); })
+      .catch(() => setLockError('चुकीचा password'));
+  };
+
+  useEffect(() => {
+    if (!user) return;
+    const uid = user.uid;
+    replayPending(uid);
+    const un1 = onSnapshot(booksCol(uid), (snap) =>
+      setBooks(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    const un2 = onSnapshot(wishCol(uid), (snap) =>
+      setWishlists(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    const un3 = onSnapshot(recycleCol(uid), (snap) =>
+      setRecycle(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    const un4 = onSnapshot(libDoc(uid), (snap) => {
+      if (snap.exists()) setSettings((s) => ({ ...s, ...snap.data() }));
+    });
+    return () => { un1(); un2(); un3(); un4(); };
+  }, [user]);
+
+  const writeBackup = (dirUri, payload) => {
+    clearTimeout(backupTimer.current);
+    backupTimer.current = setTimeout(async () => {
+      try {
+        const json = JSON.stringify(payload, null, 2);
+        const fileName = 'library-backup.json';
+        const files = await FileSystem.StorageAccessFramework.readDirectoryAsync(dirUri);
+        let fileUri = files.find((f) => f.includes(fileName));
+        if (!fileUri) fileUri = await FileSystem.StorageAccessFramework.createFileAsync(dirUri, fileName, 'application/json');
+        await FileSystem.StorageAccessFramework.writeAsStringAsync(fileUri, json, { encoding: FileSystem.EncodingType.UTF8 });
+      } catch (e) { console.log('backup failed', e); }
+    }, 800);
+  };
+  useEffect(() => {
+    if (!backupDirUri || !user) return;
+    writeBackup(backupDirUri, { books, wishlists, settings, recycle, exportedAt: Date.now() });
+  }, [books, wishlists, settings, recycle, backupDirUri]);
+
+  const chooseBackupFolder = async () => {
+    const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+    if (!perm.granted) { Alert.alert('Permission नाकारली'); return; }
+    await AsyncStorage.setItem('backupDirUri', perm.directoryUri);
+    setBackupDirUri(perm.directoryUri);
+    Alert.alert('झालं ✓', 'आता प्रत्येक बदल त्या folder मध्ये पण save होईल');
+  };
+
+  const exportItemsToExcel = async (kind, items) => {
+    if (items.length === 0) { Alert.alert('काहीच नाही'); return; }
+    setExporting(true);
+    try {
+      const rows = kind === 'books'
+        ? items.map((b) => ({
+            'नाव': b.name || '', [LABELS.type]: typeLabel(b.type), 'लेखक': b.author || '',
+            [LABELS.genre]: b.genre || '', [LABELS.purchaseDate]: b.purchase || '', 'प्रकाशन': b.publication || '',
+            'किंमत (₹)': b.price || '', [LABELS.isbn]: b.isbn || '', 'टीप': b.note || '',
+          }))
+        : items.map((w) => ({ 'यादीचं नाव': w.title || '', 'तपशील': w.notes || '' }));
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, kind === 'books' ? 'Books' : 'Wishlist');
+      const base64 = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
+      const fileUri = FileSystem.cacheDirectory + `${kind}-${Date.now()}.xlsx`;
+      await FileSystem.writeAsStringAsync(fileUri, base64, { encoding: FileSystem.EncodingType.Base64 });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          dialogTitle: 'Excel file share/save करा',
+        });
+      }
+    } catch (e) { Alert.alert('चूक', e.message); }
+    setExporting(false);
+  };
+
+  const selExport = () => {
+    const ids = Object.keys(selIds);
+    const kind = selKind;
+    const sourceList = kind === 'books' ? books : wishlists;
+    const items = sourceList.filter((x) => ids.includes(x.id));
+    exportItemsToExcel(kind, items).then(clearSelect);
+  };
+  const selDelete = () => {
+    const ids = Object.keys(selIds);
+    const kind = selKind;
+    Alert.alert('Delete करायचं?', `${ids.length} item(s) recycle bin मध्ये जातील.`, [
+      { text: 'रद्द', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive', onPress: async () => {
+          const uid = user.uid;
+          const sourceList = kind === 'books' ? books : wishlists;
+          for (const id of ids) {
+            const item = sourceList.find((x) => x.id === id);
+            if (!item) continue;
+            await runOp(uid, 'addRecycle', { data: { type: kind === 'books' ? 'book' : 'wishlist', data: item, deletedAt: Date.now() } });
+            await runOp(uid, kind === 'books' ? 'deleteBook' : 'deleteWishlist', { docId: id });
+          }
+          clearSelect();
+        }
+      },
+    ]);
+  };
+
+  const handleLogin = () => {
+    if (!email || !password) { setErrorMsg('Email आणि Password दोन्ही टाका'); return; }
+    setErrorMsg(''); setLoading(true);
+    createUserWithEmailAndPassword(auth, email, password)
+      .then(() => setLoading(false))
+      .catch((err) => {
+        if (err.code === 'auth/email-already-in-use') {
+          signInWithEmailAndPassword(auth, email, password)
+            .then(() => setLoading(false))
+            .catch((err2) => { setLoading(false); setErrorMsg(err2.message); });
+        } else { setLoading(false); setErrorMsg(err.message); }
+      });
+  };
+  const handleForgotPassword = () => {
+    if (!email) { setErrorMsg('आधी वर Email टाका'); return; }
+    sendPasswordResetEmail(auth, email)
+      .then(() => Alert.alert('पाठवलं ✓', 'Email बघा (Spam पण चेक कर)'))
+      .catch((e) => Alert.alert('चूक', e.message));
+  };
+  const handleLogout = () => {
+    Alert.alert('Logout करायचं?', '', [
+      { text: 'रद्द', style: 'cancel' },
+      { text: 'Logout', style: 'destructive', onPress: () => auth.signOut() },
+    ]);
+  };
+  const handleChangePassword = () => {
+    if (!oldPass) { Alert.alert('चूक', 'सध्याचा code टाका'); return; }
+    if (newPass.length < 6) { Alert.alert('चूक', 'नवीन code किमान 6 अक्षरी हवा'); return; }
+    const cred = EmailAuthProvider.credential(user?.email, oldPass);
+    reauthenticateWithCredential(user, cred)
+      .then(() => updatePassword(user, newPass))
+      .then(() => { Alert.alert('झालं ✓', 'Entry code बदलला'); setOldPass(''); setNewPass(''); setPage('settings'); })
+      .catch((e) => Alert.alert('चूक', e.message));
+  };
+
+  const resetBookForm = () => {
+    setFormMode('add'); setFName(''); setFType('physical'); setFAuthor(''); setFGenre('');
+    setFPurchase(''); setFPublication(''); setFPrice(''); setFIsbn(''); setFNote(''); setFPhoto(null);
+  };
+  const loadBookIntoForm = (b) => {
+    setFormMode('edit'); setFName(b.name || ''); setFType(b.type || 'physical'); setFAuthor(b.author || '');
+    setFGenre(b.genre || ''); setFPurchase(b.purchase || ''); setFPublication(b.publication || '');
+    setFPrice(b.price || ''); setFIsbn(b.isbn || ''); setFNote(b.note || ''); setFPhoto(b.coverPhoto || null);
+  };
+  const pickPhoto = async (fromCamera) => {
+    const perm = fromCamera
+      ? await ImagePicker.requestCameraPermissionsAsync()
+      : await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) { Alert.alert('Permission नाकारली'); return; }
+    const result = fromCamera
+      ? await ImagePicker.launchCameraAsync({ quality: 0.7 })
+      : await ImagePicker.launchImageLibraryAsync({ quality: 0.7 });
+    if (result.canceled) return;
+    const uri = result.assets[0].uri;
+    const manipulated = await ImageManipulator.manipulateAsync(
+      uri, [{ resize: { width: 500 } }],
+      { compress: 0.6, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+    );
+    setFPhoto(`data:image/jpeg;base64,${manipulated.base64}`);
+  };
+  const saveBook = async () => {
+    if (!fName.trim()) { Alert.alert('चूक', 'नाव आवश्यक आहे'); return; }
+    const data = {
+      name: fName.trim(), type: fType, author: fAuthor.trim(), genre: fGenre.trim(),
+      purchase: fPurchase.trim(), publication: fPublication.trim(), price: fPrice.trim(),
+      isbn: fIsbn.trim(), note: fNote.trim(), coverPhoto: fPhoto || null,
+    };
+    setSavingBook(true);
+    const uid = user.uid;
+    if (formMode === 'add') await runOp(uid, 'addBook', { data: { ...data, createdAt: Date.now() } });
+    else await runOp(uid, 'updateBook', { docId: currentBookId, data });
+    setSavingBook(false);
+    setPage('home');
+  };
+  const confirmDeleteBook = () => {
+    const b = books.find((x) => x.id === currentBookId);
+    Alert.alert('Delete करायचं?', `"${b?.name}" recycle bin मध्ये जाईल.`, [
+      { text: 'रद्द', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive', onPress: async () => {
+          const uid = user.uid;
+          await runOp(uid, 'addRecycle', { data: { type: 'book', data: b, deletedAt: Date.now() } });
+          await runOp(uid, 'deleteBook', { docId: currentBookId });
+          setPage('home');
+        }
+      },
+    ]);
+  };
+
+  const newWishlist = async () => {
+    const uid = user.uid;
+    const data = { title: 'नवीन यादी', notes: '', createdAt: Date.now() };
+    const ref = await addDoc(wishCol(uid), data);
+    const id = await enqueue('addWishlistKnownId', { docId: ref.id, data });
+    waitForPendingWrites(db).then(() => dequeue(id)).catch(() => {});
+    setCurrentWishId(ref.id); setWishTitleDraft(data.title); setWishNotesDraft(''); setPage('wishdetail');
+  };
+  const openWishDetail = (w) => {
+    setCurrentWishId(w.id); setWishTitleDraft(w.title || ''); setWishNotesDraft(w.notes || ''); setPage('wishdetail');
+  };
+  const saveWishDetail = async () => {
+    const uid = user.uid;
+    await runOp(uid, 'updateWishlist', { docId: currentWishId, data: { title: wishTitleDraft, notes: wishNotesDraft } });
+    Alert.alert('Saved ✓');
+  };
+  const confirmDeleteWishlist = () => {
+    const w = wishlists.find((x) => x.id === currentWishId);
+    Alert.alert('यादी काढायची?', '', [
+      { text: 'रद्द', style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive', onPress: async () => {
+          const uid = user.uid;
+          await runOp(uid, 'addRecycle', { data: { type: 'wishlist', data: w, deletedAt: Date.now() } });
+          await runOp(uid, 'deleteWishlist', { docId: currentWishId });
+          setPage('wishlist');
+        }
+      },
+    ]);
+  };
+
+  const restoreItem = async (r) => {
+    const uid = user.uid;
+    const { id: _old, ...data } = r.data;
+    await runOp(uid, r.type === 'book' ? 'addBook' : 'addWishlistKnownId',
+      r.type === 'book' ? { data } : { docId: 'restored_' + Date.now(), data });
+    await runOp(uid, 'deleteRecycle', { docId: r.id });
+  };
+  const permanentDelete = (r) => {
+    Alert.alert('कायमचं Delete?', 'परत मिळणार नाही.', [
+      { text: 'रद्द', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: () => runOp(user.uid, 'deleteRecycle', { docId: r.id }) },
+    ]);
+  };
+
+  const saveSettingsField = (field, value) => {
+    setSettings((s) => ({ ...s, [field]: value }));
+    runOp(user.uid, 'saveSettings', { data: { [field]: value } });
+  };
+
+  if (checkingAuth) {
+    return (<SafeAreaView style={[styles.container, styles.center]}><ActivityIndicator size="large" color={COLORS.green} /></SafeAreaView>);
+  }
+
+  // ================= LOCK SCREEN =================
+  if (user && locked) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.center}>
+          <Image source={require('../../assets/images/logo.png')} style={styles.logo} />
+          <Text style={styles.title}>🔒 Lock आहे</Text>
+          <Text style={styles.subtitle}>{user.email}</Text>
+          <TextInput style={styles.input} placeholder="Password टाका" secureTextEntry value={lockPassInput} onChangeText={setLockPassInput} />
+          {lockError ? <Text style={styles.error}>{lockError}</Text> : null}
+          <TouchableOpacity style={[styles.button, styles.wideButton]} onPress={unlockApp}><Text style={styles.buttonText}>Unlock करा</Text></TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= LOGIN =================
+  if (page === 'login') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <ScrollView contentContainerStyle={styles.center}>
+          <Image source={require('../../assets/images/logo.png')} style={styles.logo} />
+          <Text style={styles.title}>गोतावळा</Text>
+          <Text style={styles.subtitle}>आम्हां घरी धन, शब्दांचीच रत्ने....</Text>
+          <TextInput style={styles.input} placeholder="Email टाका" autoCapitalize="none" keyboardType="email-address" value={email} onChangeText={setEmail} />
+          <TextInput style={styles.input} placeholder="Password टाका" secureTextEntry value={password} onChangeText={setPassword} />
+          {errorMsg ? <Text style={styles.error}>{errorMsg}</Text> : null}
+          <TouchableOpacity style={[styles.button, styles.wideButton]} onPress={handleLogin} disabled={loading}>
+            {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>आत जा</Text>}
+          </TouchableOpacity>
+          <TouchableOpacity onPress={handleForgotPassword}><Text style={styles.linkBtn}>Password विसरलात?</Text></TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= HOME =================
+  if (page === 'home') {
+    const recent = [...books].sort((a, b) => b.createdAt - a.createdAt).slice(0, 6);
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.topbar}>
+          <View style={styles.brandRow}>
+            <Image source={require('../../assets/images/logo.png')} style={styles.brandLogoImg} />
+            <View>
+              <Text style={styles.brandName}>{settings.libName}</Text>
+              <Text style={styles.brandSub}>{books.length} पुस्तकं</Text>
+            </View>
+          </View>
+          <TouchableOpacity style={styles.iconBtn} onPress={() => setPage('settings')}><Text style={{ fontSize: 17 }}>⚙️</Text></TouchableOpacity>
+        </View>
+        <TouchableOpacity style={styles.searchBar} onPress={() => { setSearchQuery(''); clearSelect(); setPage('search'); }}>
+          <Text style={{ fontSize: 16, color: COLORS.inkSoft }}>🔍</Text>
+          <Text style={styles.searchPlaceholder}>पुस्तक शोधा...</Text>
+        </TouchableOpacity>
+        <View style={styles.grid2}>
+          <TouchableOpacity style={[styles.tile, styles.tileOrange]} onPress={() => { resetBookForm(); setPage('addbook'); }}>
+            <Text style={styles.tileIcon}>➕</Text><Text style={styles.tileLabel}>नवीन</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.tile, styles.tileOrange]} onPress={() => { clearSelect(); setPage('wishlist'); }}>
+            <Text style={styles.tileIcon}>📝</Text><Text style={styles.tileLabel}>नोंदी</Text>
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity style={[styles.tile, styles.tileOrange, styles.tileStats]} onPress={() => setPage('stats')}>
+          <Text style={styles.tileIcon}>📊</Text><Text style={styles.tileLabel}>विश्लेषण</Text>
+        </TouchableOpacity>
+        <View style={styles.sectionHead}>
+          <Text style={styles.sectionTitle}>नुकतीच जोडलेली</Text>
+          <TouchableOpacity onPress={() => { clearSelect(); setPage('allbooks'); }}><Text style={styles.linkBtn}>सगळी पाहा</Text></TouchableOpacity>
+        </View>
+        {recent.length === 0 ? (
+          <Text style={styles.emptyText}>अजून पुस्तकं नाहीत</Text>
+        ) : (
+          <FlatList data={recent} keyExtractor={(i) => i.id} numColumns={2}
+            columnWrapperStyle={{ gap: 10 }} contentContainerStyle={{ gap: 10, paddingBottom: 20 }}
+            renderItem={({ item }) => (
+              <TouchableOpacity style={styles.bookCardGreen} onPress={() => { setCurrentBookId(item.id); setPage('bookdetail'); }}>
+                {item.coverPhoto
+                  ? <Image source={{ uri: item.coverPhoto }} style={styles.bookCoverImg} />
+                  : <View style={[styles.bookCover, { backgroundColor: colorFor(item.name) }]}><Text style={{ color: '#fff', fontWeight: '700' }}>{item.name.charAt(0)}</Text></View>}
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.bookNameOnGreen} numberOfLines={1}>{item.name}</Text>
+                  <Text style={styles.bookSubOnGreen}>{typeLabel(item.type)} · {item.author}</Text>
+                </View>
+              </TouchableOpacity>
+            )} />
+        )}
+      </SafeAreaView>
+    );
+  }
+
+  // ================= ADD / EDIT BOOK =================
+  if (page === 'addbook') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage(formMode === 'edit' ? 'bookdetail' : 'home')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>{formMode === 'edit' ? 'पुस्तक Edit करा' : 'नवीन पुस्तक'}</Text>
+        </View>
+        <ScrollView>
+          {fPhoto ? <Image source={{ uri: fPhoto }} style={styles.formPhotoPreview} /> : null}
+          {fPhoto ? (
+            <TouchableOpacity onPress={() => setFPhoto(null)} style={{ marginBottom: 10 }}>
+              <Text style={{ color: COLORS.terracotta, fontWeight: '700', fontSize: 12 }}>✕ Cover काढा</Text>
+            </TouchableOpacity>
+          ) : null}
+          <View style={{ flexDirection: 'row', gap: 10, marginBottom: 14 }}>
+            <TouchableOpacity style={styles.smallBtn} onPress={() => pickPhoto(false)}><Text>{LABELS.galleryBtn}</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.smallBtn} onPress={() => pickPhoto(true)}><Text>📷 Camera</Text></TouchableOpacity>
+          </View>
+          <Text style={styles.label}>पुस्तकाचं नाव *</Text>
+          <TextInput style={styles.fieldInput} value={fName} onChangeText={setFName} />
+          <Text style={styles.label}>{LABELS.type} *</Text>
+          <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
+            <TouchableOpacity style={[styles.segBtn, fType === 'physical' && styles.segBtnSel]} onPress={() => setFType('physical')}><Text style={fType === 'physical' ? styles.segTextSel : styles.segText}>{LABELS.typePhysical}</Text></TouchableOpacity>
+            <TouchableOpacity style={[styles.segBtn, fType === 'e' && styles.segBtnSel]} onPress={() => setFType('e')}><Text style={fType === 'e' ? styles.segTextSel : styles.segText}>{LABELS.typeEbook}</Text></TouchableOpacity>
+          </View>
+          <Text style={styles.label}>लेखक</Text><TextInput style={styles.fieldInput} value={fAuthor} onChangeText={setFAuthor} />
+          <Text style={styles.label}>{LABELS.genre}</Text><TextInput style={styles.fieldInput} value={fGenre} onChangeText={setFGenre} />
+          <Text style={styles.label}>{LABELS.purchaseDate}</Text>
+          <TouchableOpacity style={styles.fieldInput} onPress={() => setShowDatePicker(true)}>
+            <Text style={{ color: fPurchase ? COLORS.ink : COLORS.inkSoft }}>{fPurchase || 'दिनांक निवडा'}</Text>
+          </TouchableOpacity>
+          {showDatePicker && (
+            <DateTimePicker
+              value={fPurchase ? new Date(fPurchase) : new Date()}
+              mode="date"
+              display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+              onChange={(event, selectedDate) => {
+                setShowDatePicker(false);
+                if (event.type === 'set' && selectedDate) setFPurchase(fmtDate(selectedDate));
+              }}
+            />
+          )}
+          <Text style={styles.label}>प्रकाशन</Text><TextInput style={styles.fieldInput} value={fPublication} onChangeText={setFPublication} />
+          <Text style={styles.label}>किंमत (₹)</Text><TextInput style={styles.fieldInput} value={fPrice} onChangeText={setFPrice} keyboardType="numeric" />
+          <Text style={styles.label}>{LABELS.isbn}</Text><TextInput style={styles.fieldInput} value={fIsbn} onChangeText={setFIsbn} />
+          <Text style={styles.label}>विशेष टीप</Text>
+          <TextInput style={[styles.fieldInput, { height: 70 }]} value={fNote} onChangeText={setFNote} multiline />
+          <TouchableOpacity style={styles.button} onPress={saveBook} disabled={savingBook}>
+            {savingBook ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Save करा</Text>}
+          </TouchableOpacity>
+          <View style={{ height: 30 }} />
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= BOOK DETAIL =================
+  if (page === 'bookdetail') {
+    const b = books.find((x) => x.id === currentBookId);
+    if (!b) { setPage('home'); return null; }
+    const rows = [
+      [LABELS.type, typeLabel(b.type)], ['लेखक', b.author], [LABELS.genre, b.genre],
+      [LABELS.purchaseDate, b.purchase], ['Publication', b.publication], ['किंमत', b.price ? '₹' + b.price : ''], [LABELS.isbn, b.isbn],
+    ].filter((r) => r[1]);
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('home')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>पुस्तक तपशील</Text>
+        </View>
+        <ScrollView>
+          {b.coverPhoto
+            ? <Image source={{ uri: b.coverPhoto }} style={styles.profileCover} resizeMode="cover" />
+            : <View style={[styles.profileCover, { backgroundColor: colorFor(b.name), justifyContent: 'center', alignItems: 'center' }]}><Text style={{ color: '#fff', fontSize: 40, fontWeight: '700' }}>{b.name.charAt(0)}</Text></View>}
+          <Text style={[styles.title, { fontSize: 20, marginBottom: 10, textAlign: 'center' }]}>{b.name}</Text>
+          {rows.map((r) => (
+            <View key={r[0]} style={styles.detailRow}><Text style={styles.detailLabel}>{r[0]}</Text><Text style={styles.detailVal}>{r[1]}</Text></View>
+          ))}
+          {b.note ? <Text style={styles.noteBox}>{b.note}</Text> : null}
+          <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
+            <TouchableOpacity style={[styles.button, { flex: 1, backgroundColor: COLORS.card, borderWidth: 1, borderColor: COLORS.border }]} onPress={() => { loadBookIntoForm(b); setPage('addbook'); }}>
+              <Text style={[styles.buttonText, { color: COLORS.ink }]}>✏️ Edit</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.button, { flex: 1, backgroundColor: COLORS.terracotta }]} onPress={confirmDeleteBook}>
+              <Text style={styles.buttonText}>🗑 Delete</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={{ height: 30 }} />
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= SEARCH =================
+  if (page === 'search') {
+    const q = searchQuery.trim().toLowerCase();
+    const fields = ['name', 'author', 'genre', 'publication', 'isbn', 'note'];
+    const results = q ? books.filter((b) => fields.some((f) => (b[f] || '').toLowerCase().includes(q))) : [];
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => { clearSelect(); setPage('home'); }}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>पुस्तक शोधा</Text>
+        </View>
+        <TextInput style={styles.input} placeholder="नाव, लेखक, प्रकार..." value={searchQuery} onChangeText={setSearchQuery} autoFocus />
+        <FlatList data={results} keyExtractor={(i) => i.id}
+          ListEmptyComponent={q ? <Text style={styles.emptyText}>काही सापडलं नाही</Text> : null}
+          renderItem={({ item }) => {
+            const selected = !!selIds[item.id];
+            return (
+              <TouchableOpacity style={styles.listRowGreen}
+                onLongPress={() => startSelect('books', item.id)}
+                onPress={() => {
+                  if (isSelecting('books')) toggleSelect('books', item.id);
+                  else { setCurrentBookId(item.id); setPage('bookdetail'); }
+                }}>
+                {isSelecting('books') && (
+                  <View style={[styles.selCheck, selected && styles.selCheckOn]}>{selected ? <Text style={{ color: '#fff', fontSize: 12 }}>✓</Text> : null}</View>
+                )}
+                {item.coverPhoto
+                  ? <Image source={{ uri: item.coverPhoto }} style={styles.bookCoverImg} />
+                  : <View style={[styles.bookCover, { backgroundColor: colorFor(item.name) }]}><Text style={{ color: '#fff', fontWeight: '700' }}>{item.name.charAt(0)}</Text></View>}
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.bookNameOnGreen}>{item.name}</Text>
+                  <Text style={styles.bookSubOnGreen}>{typeLabel(item.type)} · {item.author}</Text>
+                </View>
+              </TouchableOpacity>
+            );
+          }} />
+        {isSelecting('books') && (
+          <View style={styles.msBar}>
+            <Text style={styles.msCount}>{Object.keys(selIds).length} निवडले</Text>
+            <View style={{ flexDirection: 'row', gap: 18 }}>
+              <TouchableOpacity onPress={selExport}><Text style={styles.msBtn}>⬇️ Export</Text></TouchableOpacity>
+              <TouchableOpacity onPress={selDelete}><Text style={styles.msBtn}>🗑️ Delete</Text></TouchableOpacity>
+              <TouchableOpacity onPress={clearSelect}><Text style={styles.msBtn}>✕</Text></TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </SafeAreaView>
+    );
+  }
+
+  // ================= WISHLIST =================
+  if (page === 'wishlist') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => { clearSelect(); setPage('home'); }}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>Wish List</Text>
+        </View>
+        <FlatList data={wishlists} keyExtractor={(i) => i.id}
+          ListEmptyComponent={<Text style={styles.emptyText}>यादी रिकामी आहे</Text>}
+          renderItem={({ item }) => {
+            const selected = !!selIds[item.id];
+            return (
+              <TouchableOpacity style={styles.wishRow}
+                onLongPress={() => startSelect('wishlists', item.id)}
+                onPress={() => {
+                  if (isSelecting('wishlists')) toggleSelect('wishlists', item.id);
+                  else openWishDetail(item);
+                }}>
+                {isSelecting('wishlists') && (
+                  <View style={[styles.selCheck, selected && styles.selCheckOn]}>{selected ? <Text style={{ color: '#fff', fontSize: 12 }}>✓</Text> : null}</View>
+                )}
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.bookName}>{item.title || 'नवीन यादी'}</Text>
+                  <Text style={styles.bookSub} numberOfLines={1}>{item.notes || 'तपशील नाही'}</Text>
+                </View>
+                {!isSelecting('wishlists') && <Text>›</Text>}
+              </TouchableOpacity>
+            );
+          }} />
+        <TouchableOpacity style={styles.button} onPress={newWishlist}><Text style={styles.buttonText}>+ नवीन यादी</Text></TouchableOpacity>
+        {isSelecting('wishlists') && (
+          <View style={styles.msBar}>
+            <Text style={styles.msCount}>{Object.keys(selIds).length} निवडले</Text>
+            <View style={{ flexDirection: 'row', gap: 18 }}>
+              <TouchableOpacity onPress={selExport}><Text style={styles.msBtn}>⬇️ Export</Text></TouchableOpacity>
+              <TouchableOpacity onPress={selDelete}><Text style={styles.msBtn}>🗑️ Delete</Text></TouchableOpacity>
+              <TouchableOpacity onPress={clearSelect}><Text style={styles.msBtn}>✕</Text></TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </SafeAreaView>
+    );
+  }
+  if (page === 'wishdetail') {
+    const w = wishlists.find((x) => x.id === currentWishId);
+    if (!w) { setPage('wishlist'); return null; }
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('wishlist')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>यादी</Text>
+        </View>
+        <Text style={styles.label}>यादीचं नाव</Text>
+        <TextInput style={styles.fieldInput} value={wishTitleDraft} onChangeText={setWishTitleDraft} />
+        <Text style={styles.label}>तपशील / आठवण</Text>
+        <TextInput style={[styles.fieldInput, { height: 140 }]} multiline value={wishNotesDraft}
+          onChangeText={setWishNotesDraft} placeholder="कोणतं पुस्तक घ्यायचंय..." />
+        <TouchableOpacity style={styles.button} onPress={saveWishDetail}><Text style={styles.buttonText}>Save करा</Text></TouchableOpacity>
+        <TouchableOpacity style={[styles.button, { backgroundColor: COLORS.terracotta, marginTop: 10 }]} onPress={confirmDeleteWishlist}>
+          <Text style={styles.buttonText}>🗑️ यादी काढून टाका</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= STATISTICS =================
+  if (page === 'stats') {
+    const physical = books.filter((b) => b.type === 'physical').length;
+    const ebook = books.filter((b) => b.type === 'e').length;
+    const genreMap = {};
+    books.forEach((b) => { const g = b.genre || 'इतर'; genreMap[g] = (genreMap[g] || 0) + 1; });
+    const total = books.length || 1;
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('home')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>विश्लेषण</Text>
+        </View>
+        <ScrollView>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-around', marginBottom: 20 }}>
+            <View style={{ alignItems: 'center' }}><Text style={styles.statNum}>{books.length}</Text><Text style={styles.bookSub}>एकूण</Text></View>
+            <View style={{ alignItems: 'center' }}><Text style={styles.statNum}>{physical}</Text><Text style={styles.bookSub}>{LABELS.typePhysical}</Text></View>
+            <View style={{ alignItems: 'center' }}><Text style={styles.statNum}>{ebook}</Text><Text style={styles.bookSub}>{LABELS.typeEbook}</Text></View>
+          </View>
+          <Text style={styles.label}>{LABELS.type}नुसार</Text>
+          <View style={styles.barTrack}><View style={[styles.barFill, { width: `${(physical / total) * 100}%`, backgroundColor: COLORS.green }]} /></View>
+          <Text style={styles.bookSub}>{LABELS.typePhysical}: {physical} · {LABELS.typeEbook}: {ebook}</Text>
+          <Text style={[styles.label, { marginTop: 20 }]}>{LABELS.genre} नुसार</Text>
+          {Object.entries(genreMap).map(([g, c], i) => (
+            <View key={g} style={{ marginBottom: 8 }}>
+              <Text style={styles.bookSub}>{g} ({c})</Text>
+              <View style={styles.barTrack}><View style={[styles.barFill, { width: `${(c / total) * 100}%`, backgroundColor: PALETTE[i % PALETTE.length] }]} /></View>
+            </View>
+          ))}
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= ALL BOOKS =================
+  if (page === 'allbooks') {
+    let list = [...books];
+    if (sortMode === 'latest') list.sort((a, b) => b.createdAt - a.createdAt);
+    if (sortMode === 'earliest') list.sort((a, b) => a.createdAt - b.createdAt);
+    if (sortMode === 'az') list.sort((a, b) => a.name.localeCompare(b.name));
+    if (sortMode === 'za') list.sort((a, b) => b.name.localeCompare(a.name));
+    const chips = [['latest', 'Latest आधी'], ['earliest', 'Earliest आधी'], ['az', 'A→Z'], ['za', 'Z→A']];
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => { clearSelect(); setPage('home'); }}><Text>←</Text></TouchableOpacity>
+          <Text style={[styles.pageTitle, { flex: 1 }]}>सगळी पुस्तकं</Text>
+        </View>
+        <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+          {chips.map(([v, l]) => (
+            <TouchableOpacity key={v} style={[styles.chip, sortMode === v && styles.chipSel]} onPress={() => setSortMode(v)}>
+              <Text style={sortMode === v ? styles.chipTextSel : styles.chipText}>{l}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+        <FlatList data={list} keyExtractor={(i) => i.id}
+          ListEmptyComponent={<Text style={styles.emptyText}>यादी रिकामी आहे</Text>}
+          renderItem={({ item }) => {
+            const selected = !!selIds[item.id];
+            return (
+              <TouchableOpacity style={styles.listRowGreen}
+                onLongPress={() => startSelect('books', item.id)}
+                onPress={() => {
+                  if (isSelecting('books')) toggleSelect('books', item.id);
+                  else { setCurrentBookId(item.id); setPage('bookdetail'); }
+                }}>
+                {isSelecting('books') && (
+                  <View style={[styles.selCheck, selected && styles.selCheckOn]}>{selected ? <Text style={{ color: '#fff', fontSize: 12 }}>✓</Text> : null}</View>
+                )}
+                {item.coverPhoto
+                  ? <Image source={{ uri: item.coverPhoto }} style={styles.bookCoverImg} />
+                  : <View style={[styles.bookCover, { backgroundColor: colorFor(item.name) }]}><Text style={{ color: '#fff', fontWeight: '700' }}>{item.name.charAt(0)}</Text></View>}
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.bookNameOnGreen}>{item.name}</Text>
+                  <Text style={styles.bookSubOnGreen}>{typeLabel(item.type)} · {item.author}</Text>
+                </View>
+              </TouchableOpacity>
+            );
+          }} />
+        {isSelecting('books') && (
+          <View style={styles.msBar}>
+            <Text style={styles.msCount}>{Object.keys(selIds).length} निवडले</Text>
+            <View style={{ flexDirection: 'row', gap: 18 }}>
+              <TouchableOpacity onPress={selExport}><Text style={styles.msBtn}>⬇️ Export</Text></TouchableOpacity>
+              <TouchableOpacity onPress={selDelete}><Text style={styles.msBtn}>🗑️ Delete</Text></TouchableOpacity>
+              <TouchableOpacity onPress={clearSelect}><Text style={styles.msBtn}>✕</Text></TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </SafeAreaView>
+    );
+  }
+
+  // ================= SETTINGS =================
+  if (page === 'settings') {
+    const lockLabel = { always: 'नेहमी', '5min': '5 मिनिटं', off: 'बंद' }[lockPref];
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('home')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>Settings</Text>
+        </View>
+        <ScrollView>
+          <Text style={styles.label}>ग्रंथालयाचं नाव</Text>
+          <TextInput style={styles.fieldInput} defaultValue={settings.libName} onEndEditing={(e) => saveSettingsField('libName', e.nativeEvent.text)} />
+          <Text style={styles.label}>About Us</Text>
+          <TextInput style={[styles.fieldInput, { height: 70 }]} multiline defaultValue={settings.about} onEndEditing={(e) => saveSettingsField('about', e.nativeEvent.text)} />
+
+          <Text style={[styles.sectionTitle, { marginTop: 16, marginBottom: 8 }]}>Security</Text>
+          <TouchableOpacity style={styles.settingsRow} onPress={() => setPage('changepass')}>
+            <Text style={styles.bookName}>🔑 Password बदला</Text><Text>›</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.settingsRow} onPress={() => setPage('applock')}>
+            <Text style={styles.bookName}>App Lock 🔐</Text>
+            <Text style={{ fontSize: 11, color: COLORS.inkSoft }}>{lockLabel}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.settingsRow} onPress={chooseBackupFolder}>
+            <Text style={styles.bookName}>📂 Device Backup Folder</Text>
+            <Text style={{ fontSize: 11, color: COLORS.inkSoft }}>{backupDirUri ? 'जोडलेलं ✓' : 'निवडा'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.settingsRow} onPress={() => setPage('recyclebin')}>
+            <Text style={styles.bookName}>♻️ Recycle Bin</Text><Text>›</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.settingsRow} onPress={handleLogout}>
+            <Text style={[styles.bookName, { color: COLORS.terracotta }]}>Log out 📤</Text><Text>›</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= APP LOCK =================
+  if (page === 'applock') {
+    const options = [
+      ['always', 'बंद करून परत उघडल्यावर लगेच'],
+      ['5min', '5 मिनिटं वापरला नाही तर'],
+      ['off', 'Lock बंद (Turn off)'],
+    ];
+    const setPref = async (v) => { setLockPref(v); await AsyncStorage.setItem('appLockPref', v); };
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('settings')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>App Lock</Text>
+        </View>
+        <Text style={{ fontSize: 12, color: COLORS.inkSoft, marginBottom: 14 }}>ही निवड फक्त याच device साठी लागू होते.</Text>
+        {options.map(([v, label]) => (
+          <TouchableOpacity key={v} style={styles.settingsRow} onPress={() => setPref(v)}>
+            <Text style={styles.bookName}>{label}</Text>
+            <View style={[styles.selCheck, lockPref === v && styles.selCheckOn, { borderColor: COLORS.green }]}>
+              {lockPref === v ? <Text style={{ color: '#fff', fontSize: 12 }}>✓</Text> : null}
+            </View>
+          </TouchableOpacity>
+        ))}
+      </SafeAreaView>
+    );
+  }
+
+  // ================= CHANGE PASSWORD =================
+  if (page === 'changepass') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('settings')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>Password बदला</Text>
+        </View>
+        <Text style={styles.label}>सध्याचा Password</Text>
+        <TextInput style={styles.fieldInput} secureTextEntry value={oldPass} onChangeText={setOldPass} />
+        <Text style={styles.label}>नवीन Password</Text>
+        <TextInput style={styles.fieldInput} secureTextEntry value={newPass} onChangeText={setNewPass} />
+        <TouchableOpacity style={styles.button} onPress={handleChangePassword}><Text style={styles.buttonText}>Save करा</Text></TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // ================= RECYCLE BIN =================
+  if (page === 'recyclebin') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.pageHead}>
+          <TouchableOpacity style={styles.backBtn} onPress={() => setPage('settings')}><Text>←</Text></TouchableOpacity>
+          <Text style={styles.pageTitle}>Recycle Bin</Text>
+        </View>
+        <FlatList data={recycle} keyExtractor={(i) => i.id}
+          ListEmptyComponent={<Text style={styles.emptyText}>Recycle bin रिकामी आहे</Text>}
+          renderItem={({ item }) => (
+            <View style={styles.wishRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.bookName}>{item.type === 'book' ? item.data.name : (item.data.title || 'यादी')}</Text>
+                <Text style={styles.bookSub}>{item.type === 'book' ? '📕 पुस्तक' : '📝 Wishlist'}</Text>
+              </View>
+              <TouchableOpacity onPress={() => restoreItem(item)}><Text style={[styles.linkBtn, { marginRight: 14 }]}>Restore</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => permanentDelete(item)}><Text style={{ color: COLORS.terracotta, fontSize: 12, fontWeight: '700' }}>Delete</Text></TouchableOpacity>
+            </View>
+          )} />
+      </SafeAreaView>
+    );
+  }
+
+  return null;
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1, backgroundColor: COLORS.paper, paddingHorizontal: 16,
+    paddingTop: (Platform.OS === 'android' ? StatusBar.currentHeight || 24 : 0) + 10,
+  },
+  center: { flexGrow: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+  logo: { width: 140, height: 140, marginBottom: 16, borderRadius: 30 },
+  title: { fontSize: 26, fontWeight: '700', color: COLORS.ink, marginBottom: 6 },
+  subtitle: { fontSize: 13, color: COLORS.inkSoft, marginBottom: 24, textAlign: 'center' },
+  input: {
+    width: '100%', backgroundColor: COLORS.card, padding: 14, borderRadius: 12,
+    marginBottom: 14, borderWidth: 1, borderColor: COLORS.border, textAlign: 'center',
+  },
+  error: { color: COLORS.terracotta, marginBottom: 10, fontSize: 12.5 },
+  button: { backgroundColor: COLORS.green, paddingVertical: 13, borderRadius: 16, marginTop: 10, alignItems: 'center' },
+  wideButton: { width: 190, alignSelf: 'center' },
+  buttonText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  linkBtn: { color: COLORS.terracotta, fontWeight: '700', fontSize: 12.5, marginTop: 14 },
+
+  topbar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  brandLogoImg: { width: 42, height: 42, borderRadius: 10 },
+  brandName: { fontSize: 18, fontWeight: '700', color: COLORS.ink },
+  brandSub: { fontSize: 11, color: COLORS.inkSoft },
+  iconBtn: { width: 38, height: 38, borderRadius: 19, backgroundColor: COLORS.card, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(58,47,34,0.12)' },
+  searchBar: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: COLORS.card, borderRadius: 16, paddingVertical: 12, paddingHorizontal: 14, marginBottom: 14, borderWidth: 1, borderColor: 'rgba(58,47,34,0.10)' },
+  searchPlaceholder: { color: COLORS.inkSoft, fontSize: 14 },
+
+  grid2: { flexDirection: 'row', gap: 10, marginBottom: 10 },
+  tile: { flex: 1, borderRadius: 20, padding: 16, minHeight: 90, justifyContent: 'space-between' },
+  tileOrange: { backgroundColor: COLORS.tileOrange },
+  tileStats: { flex: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', height: 74, marginBottom: 16 },
+  tileIcon: { fontSize: 22 }, tileLabel: { fontSize: 15, fontWeight: '700', color: COLORS.ink },
+
+  sectionHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 },
+  sectionTitle: { fontSize: 16, fontWeight: '700', color: COLORS.ink },
+  emptyText: { textAlign: 'center', color: COLORS.inkSoft, marginTop: 30 },
+
+  bookCardGreen: { width: '48%', backgroundColor: COLORS.green, borderRadius: 14, padding: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  listRowGreen: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: COLORS.green, borderRadius: 14, padding: 10, marginBottom: 9 },
+  bookCover: { width: 34, height: 48, borderRadius: 5, justifyContent: 'center', alignItems: 'center' },
+  bookCoverImg: { width: 34, height: 48, borderRadius: 5, backgroundColor: COLORS.card },
+  bookName: { fontWeight: '700', fontSize: 13, color: COLORS.ink },
+  bookSub: { fontSize: 11, color: COLORS.inkSoft },
+  bookNameOnGreen: { fontWeight: '700', fontSize: 13, color: '#fff' },
+  bookSubOnGreen: { fontSize: 11, color: '#eef3ec' },
+
+  pageHead: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16 },
+  backBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.card, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(58,47,34,0.12)' },
+  pageTitle: { fontSize: 18, fontWeight: '700', color: COLORS.ink },
+
+  wishRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.card, borderRadius: 14, padding: 13, marginBottom: 10, gap: 8 },
+  settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: COLORS.card, borderRadius: 12, padding: 13, marginBottom: 8 },
+
+  label: { fontSize: 12, fontWeight: '700', color: COLORS.inkSoft, marginBottom: 5, marginTop: 4 },
+  fieldInput: { backgroundColor: COLORS.card, borderRadius: 10, borderWidth: 1, borderColor: COLORS.border, padding: 11, marginBottom: 12, fontSize: 14, color: COLORS.ink },
+  segBtn: { flex: 1, padding: 10, borderRadius: 10, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.card, alignItems: 'center' },
+  segBtnSel: { backgroundColor: COLORS.green, borderColor: COLORS.green },
+  segText: { color: COLORS.inkSoft, fontWeight: '600' }, segTextSel: { color: '#fff', fontWeight: '700' },
+  smallBtn: { flex: 1, padding: 10, borderRadius: 10, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.card, alignItems: 'center' },
+  formPhotoPreview: { width: 120, height: 168, borderRadius: 10, marginBottom: 6, backgroundColor: COLORS.card, alignSelf: 'flex-start' },
+
+  profileCover: { width: 180, height: 250, borderRadius: 16, marginBottom: 14, alignSelf: 'center' },
+  detailRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: 'rgba(58,47,34,0.15)', borderStyle: 'dashed' },
+  detailLabel: { color: COLORS.inkSoft, fontSize: 13 }, detailVal: { fontWeight: '700', fontSize: 13, color: COLORS.ink },
+  noteBox: { backgroundColor: COLORS.card, borderRadius: 10, padding: 12, fontStyle: 'italic', color: COLORS.inkSoft, marginTop: 10 },
+
+  statNum: { fontSize: 24, fontWeight: '700', color: COLORS.ink },
+  barTrack: { height: 10, backgroundColor: COLORS.card, borderRadius: 6, overflow: 'hidden', marginBottom: 6, marginTop: 4 },
+  barFill: { height: '100%', borderRadius: 6 },
+  chip: { paddingVertical: 7, paddingHorizontal: 13, borderRadius: 20, backgroundColor: COLORS.card, borderWidth: 1, borderColor: COLORS.border },
+  chipSel: { backgroundColor: COLORS.terracotta, borderColor: COLORS.terracotta },
+  chipText: { fontSize: 12, fontWeight: '600', color: COLORS.inkSoft }, chipTextSel: { fontSize: 12, fontWeight: '700', color: '#fff' },
+
+  selCheck: { width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: COLORS.sky, justifyContent: 'center', alignItems: 'center' },
+  selCheckOn: { backgroundColor: COLORS.sky },
+  msBar: {
+    position: 'absolute', left: 0, right: 0, bottom: 0, backgroundColor: COLORS.ink,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingVertical: 14, paddingHorizontal: 18, borderTopLeftRadius: 20, borderTopRightRadius: 20,
+  },
+  msCount: { color: '#fdf8ec', fontWeight: '700', fontSize: 13 },
+  msBtn: { color: '#fdf8ec', fontWeight: '700', fontSize: 12 },
+});
